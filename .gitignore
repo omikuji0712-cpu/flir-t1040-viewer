@@ -1,0 +1,17 @@
+# PyInstaller ビルド成果物
+build/
+dist/
+*.spec
+
+# 実行時に自動生成されるファイル
+captures/
+settings.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# マニュアル生成スクリプト（配布不要）
+make_manual.py
+FLIR_T1040_Viewer_Manual.docx
