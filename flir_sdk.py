@@ -157,6 +157,63 @@ ACS_FileFormat_fff             = 1
 ACS_LogLevel_off               = 0
 
 
+# ── エラーメッセージ日本語対応表 ────────────────────────────────────────────────
+# FLIR Atlas C SDK が返す英語メッセージ（安定した errc 列挙体由来）を日本語化する。
+# 未知のメッセージは原文を併記してフォールバックする。
+
+_ERROR_JA = {
+    # カメラ状態
+    "camera ok":                                                   "正常",
+    "camera is not connected":                                     "カメラが接続されていません",
+    "camera is already streaming":                                 "カメラは既にストリーミング中です",
+    "camera not ready error":                                      "カメラの準備ができていません",
+    "camera general error":                                        "カメラの一般エラーが発生しました",
+    "camera does not support this feature.":                       "カメラがこの機能に対応していません",
+    "camera function not yet supported error":                     "カメラがこの機能にまだ対応していません",
+    "camera undefined function error":                             "未定義のカメラ機能が呼び出されました",
+    "camera is not mounted":                                       "カメラがマウントされていません",
+    "camera is upgrading firmware.":                               "カメラがファームウェアを更新中です",
+    "camera operation canceled":                                   "カメラ操作がキャンセルされました",
+    "camera range error":                                          "カメラの値が範囲外です",
+    "camera input data is out of valid range error":              "入力データが有効範囲外です",
+    "camera bad argument  error":                                  "カメラへの引数が不正です",
+    "camera byte count error":                                     "カメラのバイト数エラーが発生しました",
+    "camera checksum error":                                       "カメラのチェックサムエラーが発生しました",
+    "camera otp write error":                                      "カメラの OTP 書き込みエラーが発生しました",
+    "camera unable to execute command due to current camera state":
+        "現在のカメラ状態ではコマンドを実行できません",
+    "bad date on camera":                                          "カメラの日時設定が不正です",
+    # 接続・ネットワーク・認証
+    "authentication failed":                                       "認証に失敗しました",
+    "authentication failure":                                      "認証に失敗しました",
+    "authentication cancelled":                                    "認証がキャンセルされました",
+    "access denied to remote resource":                            "リモートリソースへのアクセスが拒否されました",
+    "address already in use":                                      "アドレスは既に使用中です",
+    "address in use":                                              "アドレスは既に使用中です",
+    "api timeout expired":                                         "通信がタイムアウトしました",
+    "accept timeout occurred while waiting server connect":        "サーバー接続待ちでタイムアウトしました",
+    # メモリ・内部
+    "a memory allocation failure occurred.":                       "メモリの割り当てに失敗しました",
+    "a memory function failed":                                    "メモリ処理に失敗しました",
+    "an unexpected internal failure occurred":                     "予期しない内部エラーが発生しました",
+    "buffer is invalid":                                           "バッファが不正です",
+}
+
+
+def translate_error(eng_msg: str) -> str:
+    """SDK の英語エラーメッセージを日本語化する。未知なら原文を返す。"""
+    if not eng_msg:
+        return ""
+    key = eng_msg.strip().lower()
+    if key in _ERROR_JA:
+        return _ERROR_JA[key]
+    # 部分一致フォールバック（SDK が詳細を付加した場合に対応）
+    for k, ja in _ERROR_JA.items():
+        if k in key:
+            return ja
+    return eng_msg  # 未知のメッセージは原文のまま
+
+
 # ── データクラス ──────────────────────────────────────────────────────────────
 
 class CameraInfo:
@@ -248,7 +305,7 @@ class FlirCamera:
 
         @_CB_ON_DISC_ERR
         def on_disc_err(iface, err, _ctx):
-            err_hold[0] = f"Discovery エラー (code={err.code})"
+            err_hold[0] = f"カメラ検索エラー: {self._error_detail(err)}"
             found.set()
 
         self._cb_refs += [on_found, on_disc_err]
@@ -271,6 +328,20 @@ class FlirCamera:
             raise RuntimeError("カメラ Identity を取得できませんでした")
         return id_hold[0]
 
+    def _error_detail(self, err) -> str:
+        """ACS_Error から日本語のエラー詳細文を組み立てる。"""
+        msg_ptr = self._dll.ACS_getErrorMessage(err)
+        eng = ""
+        if msg_ptr:
+            raw = self._dll.ACS_String_get(msg_ptr)
+            eng = raw.decode(errors="replace") if raw else ""
+            self._dll.ACS_String_free(msg_ptr)
+        ja = translate_error(eng)
+        # 翻訳できた場合は原文を併記、できなかった場合は原文のみ
+        if ja and ja != eng:
+            return f"{ja}（原文: {eng}, code={err.code}）"
+        return f"{eng or '不明なエラー'}（code={err.code}）"
+
     def _do_connect(self, identity):
         self._camera = self._dll.ACS_Camera_alloc()
 
@@ -284,13 +355,7 @@ class FlirCamera:
             self._camera, identity, None, on_disconn, None, None)
         self._dll.ACS_Identity_free(identity)
         if err.code:
-            msg_ptr = self._dll.ACS_getErrorMessage(err)
-            msg = ""
-            if msg_ptr:
-                raw = self._dll.ACS_String_get(msg_ptr)
-                msg = raw.decode(errors="replace") if raw else ""
-                self._dll.ACS_String_free(msg_ptr)
-            raise RuntimeError(f"接続失敗 (code={err.code}): {msg}")
+            raise RuntimeError(f"接続失敗: {self._error_detail(err)}")
         log.info("カメラ接続完了")
 
     def _start_stream(self):
