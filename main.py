@@ -111,6 +111,22 @@ QPushButton:hover   { background: #D6EAF8; border-color: #2E86C1; }
 QPushButton:pressed { background: #AED6F1; }
 QPushButton:disabled { color: #AAAAAA; background: #F5F5F5; border-color: #DDDDDD; }
 
+/* --- モード切替トグル --- */
+QPushButton#btn_mode {
+    border: 1px solid #BBBBBB;
+    background: #ECECEC;
+    color: #555555;
+    padding: 4px;
+    font-size: 9pt;
+    border-radius: 0px;
+}
+QPushButton#btn_mode:checked {
+    background: #1A5276;
+    color: white;
+    border-color: #1A5276;
+    font-weight: bold;
+}
+
 /* --- キャプチャボタン --- */
 QPushButton#btn_capture {
     font-size: 14pt;
@@ -120,6 +136,9 @@ QPushButton#btn_capture {
     color: white;
     border: none;
     border-radius: 8px;
+}
+QPushButton#btn_capture[recording="true"] {
+    background: #CB4335;
 }
 QPushButton#btn_capture:hover   { background: #2874A6; }
 QPushButton#btn_capture:pressed { background: #154360; }
@@ -261,6 +280,11 @@ class MainWindow(QMainWindow):
         self._live_timer.setInterval(LIVE_INTERVAL)
         self._live_timer.timeout.connect(self._update_live)
 
+        # 録画状態の表示更新タイマー（0.5秒ごと）
+        self._rec_timer = QTimer(self)
+        self._rec_timer.setInterval(500)
+        self._rec_timer.timeout.connect(self._update_recording_status)
+
         self._set_connected(False)
 
     # ── UI 構築 ──────────────────────────────────────────────────────────────
@@ -327,11 +351,37 @@ class MainWindow(QMainWindow):
         grp = QGroupBox("キャプチャ")
         lay = QVBoxLayout(grp)
 
+        # 静止画 / 動画 モード切替
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(0)
+        self._btn_mode_photo = QPushButton("📷 静止画")
+        self._btn_mode_video = QPushButton("🎥 動画")
+        for b in (self._btn_mode_photo, self._btn_mode_video):
+            b.setObjectName("btn_mode")
+            b.setCheckable(True)
+            b.setFixedHeight(30)
+        self._btn_mode_photo.setChecked(True)
+        self._btn_mode_photo.clicked.connect(lambda: self._set_mode("photo"))
+        self._btn_mode_video.clicked.connect(lambda: self._set_mode("video"))
+        mode_row.addWidget(self._btn_mode_photo)
+        mode_row.addWidget(self._btn_mode_video)
+        lay.addLayout(mode_row)
+
+        self._mode = "photo"   # "photo" or "video"
+
         self._btn_capture = QPushButton("📷  キャプチャ")
         self._btn_capture.setObjectName("btn_capture")
         self._btn_capture.setFixedHeight(56)
         self._btn_capture.clicked.connect(self._on_capture)
         lay.addWidget(self._btn_capture)
+
+        # 録画中の経過時間表示（動画モード時のみ表示）
+        self._lbl_rec = QLabel("")
+        self._lbl_rec.setFont(QFont("Meiryo UI", 9))
+        self._lbl_rec.setStyleSheet("color: #CB4335; font-weight: bold;")
+        self._lbl_rec.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_rec.hide()
+        lay.addWidget(self._lbl_rec)
 
         self._lbl_saved = QLabel("—")
         self._lbl_saved.setFont(QFont("Meiryo UI", 8))
@@ -508,12 +558,14 @@ class MainWindow(QMainWindow):
 
     def _on_disconnect(self):
         self._live_timer.stop()
+        self._rec_timer.stop()
         if self._cam:
             try:
-                self._cam.disconnect()
+                self._cam.disconnect()  # 録画中なら内部で停止・保存される
             except Exception:
                 pass
             self._cam = None
+        self._set_recording_ui(False)
         self._set_connected(False)
         self._lbl_cam.setText("")
         self._cbo_palette.clear()
@@ -530,6 +582,8 @@ class MainWindow(QMainWindow):
                     self._emiss_grp, self._nuc_grp):
             grp.setEnabled(on)
         self._btn_capture.setEnabled(on)
+        self._btn_mode_photo.setEnabled(on)
+        self._btn_mode_video.setEnabled(on)
         self._btn_folder.setEnabled(True)
 
         if on:
@@ -574,11 +628,37 @@ class MainWindow(QMainWindow):
                 f"  |  フレーム数: {self._cam.frame_count}"
             )
 
-    # ── キャプチャ ───────────────────────────────────────────────────────────
+    # ── モード切替 ───────────────────────────────────────────────────────────
+
+    def _set_mode(self, mode: str):
+        # 録画中はモード切替を禁止
+        if self._cam and self._cam.is_recording:
+            # チェック状態を戻す
+            self._btn_mode_photo.setChecked(self._mode == "photo")
+            self._btn_mode_video.setChecked(self._mode == "video")
+            return
+        self._mode = mode
+        self._btn_mode_photo.setChecked(mode == "photo")
+        self._btn_mode_video.setChecked(mode == "video")
+        if mode == "photo":
+            self._btn_capture.setText("📷  キャプチャ")
+            self._lbl_rec.hide()
+        else:
+            self._btn_capture.setText("⏺  録画開始")
+            self._lbl_rec.setText("待機中")
+            self._lbl_rec.show()
+
+    # ── キャプチャ / 録画 ─────────────────────────────────────────────────────
 
     def _on_capture(self):
         if not self._cam:
             return
+        if self._mode == "photo":
+            self._capture_photo()
+        else:
+            self._toggle_recording()
+
+    def _capture_photo(self):
         path = self._cam.capture(prefix="flir")
         if path:
             self._lbl_saved.setText(f"✔  {Path(path).name}")
@@ -587,6 +667,51 @@ class MainWindow(QMainWindow):
             self._lbl_saved.setText("✘  キャプチャ失敗")
             self._lbl_status.setText(
                 "キャプチャ失敗 — 起動直後の場合は 2〜3 秒待ってから再試行してください")
+
+    def _toggle_recording(self):
+        if self._cam.is_recording:
+            # 録画停止
+            path = self._cam.stop_recording()
+            self._rec_timer.stop()
+            self._set_recording_ui(False)
+            if path:
+                self._lbl_saved.setText(f"✔  {Path(path).name}")
+                self._lbl_status.setText(f"録画保存完了: {path}")
+            else:
+                self._lbl_status.setText("録画停止")
+        else:
+            # 録画開始
+            path = self._cam.start_recording(prefix="flir")
+            if path:
+                self._set_recording_ui(True)
+                self._rec_timer.start()
+                self._lbl_status.setText(f"録画中: {Path(path).name}")
+            else:
+                self._lbl_status.setText("録画開始に失敗しました")
+
+    def _set_recording_ui(self, recording: bool):
+        if recording:
+            self._btn_capture.setText("⏹  録画停止")
+            self._btn_mode_photo.setEnabled(False)
+            self._btn_mode_video.setEnabled(False)
+        else:
+            self._btn_capture.setText("⏺  録画開始")
+            self._btn_mode_photo.setEnabled(True)
+            self._btn_mode_video.setEnabled(True)
+            self._lbl_rec.setText("待機中")
+        # キャプチャボタンの色を切替（赤=録画中）
+        self._btn_capture.setProperty("recording", "true" if recording else "false")
+        self._btn_capture.style().unpolish(self._btn_capture)
+        self._btn_capture.style().polish(self._btn_capture)
+
+    def _update_recording_status(self):
+        if not self._cam or not self._cam.is_recording:
+            return
+        ms, frames = self._cam.recording_status()
+        sec = ms / 1000.0
+        mm = int(sec // 60)
+        ss = sec % 60
+        self._lbl_rec.setText(f"● 録画中  {mm:02d}:{ss:04.1f}  ({frames} フレーム)")
 
     def _on_open_folder(self):
         folder = Path(self._save_dir).resolve()

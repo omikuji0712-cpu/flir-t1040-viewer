@@ -95,10 +95,22 @@ def _bind(dll: ctypes.CDLL) -> ctypes.CDLL:
         "ACS_Stream_stop":             ([_p], None),
         "ACS_Stream_isStreaming":       ([_p], ctypes.c_bool),
         "ACS_Stream_isThermal":        ([_p], ctypes.c_bool),
+        "ACS_Stream_attachRecorder":   ([_p, _p], None),
+        "ACS_Stream_detachRecorder":   ([_p], None),
         # ThermalStreamer
         "ACS_ThermalStreamer_alloc_cpu":        ([_p], _p),
         "ACS_ThermalStreamer_free":             ([_p], None),
         "ACS_ThermalStreamer_withThermalImage": ([_p, _CB_WITH_IMG, _p], None),
+        # ThermalSequenceRecorder（動画録画）
+        "ACS_ThermalSequenceRecorder_alloc":               ([], _p),
+        "ACS_ThermalSequenceRecorder_free":                ([_p], None),
+        "ACS_ThermalSequenceRecorder_start":               ([_p, ctypes.c_wchar_p], None),
+        "ACS_ThermalSequenceRecorder_stop":                ([_p], None),
+        "ACS_ThermalSequenceRecorder_pause":               ([_p], None),
+        "ACS_ThermalSequenceRecorder_resume":              ([_p], None),
+        "ACS_ThermalSequenceRecorder_getState":            ([_p], ctypes.c_int),
+        "ACS_ThermalSequenceRecorder_getFrameCounter":     ([_p], ctypes.c_size_t),
+        "ACS_ThermalSequenceRecorder_elapsedMilliSeconds": ([_p], ctypes.c_size_t),
         # ThermalImage
         "ACS_ThermalImage_saveAs":     ([_p, ctypes.c_wchar_p, ctypes.c_int], None),
         "ACS_ThermalImage_getWidth":   ([_p], ctypes.c_int),
@@ -155,6 +167,11 @@ ACS_CommunicationInterface_usb = 0x01
 ACS_FileFormat_jpeg            = 0   # RJPEG（放射温度データ埋め込み JPEG）
 ACS_FileFormat_fff             = 1
 ACS_LogLevel_off               = 0
+
+# 録画状態
+ACS_RecorderState_stopped   = 0
+ACS_RecorderState_paused    = 1
+ACS_RecorderState_recording = 2
 
 
 # ── エラーメッセージ日本語対応表 ────────────────────────────────────────────────
@@ -256,6 +273,10 @@ class FlirCamera:
         self._img_h     = 0
         self._frame_cnt = 0
         self._live_ok   = False
+
+        # 録画
+        self._recorder       = None
+        self._recording_path = None
 
         # ライブビュー用固定コールバック（GC防止のためインスタンス変数に保持）
         self._live_cb = _CB_WITH_IMG(self._on_live_frame)
@@ -419,6 +440,78 @@ class FlirCamera:
         self._dll.ACS_ThermalStreamer_withThermalImage(self._streamer, do_save, None)
         self._cb_refs.remove(do_save)
         return path if saved[0] else None
+
+    # ── 動画録画 ──────────────────────────────────────────────────────────────
+
+    def start_recording(self, prefix: str = "flir") -> str | None:
+        """録画を開始する。USB ストリームに録画機を接続してフレームを自動記録する。
+        成功時は保存先パス（.seq）を返す。"""
+        if not self._connected or not self._stream:
+            return None
+        if self._recorder:
+            return None  # 既に録画中
+        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = str(self.save_dir / f"{prefix}_{ts}.seq")
+        try:
+            self._recorder = self._dll.ACS_ThermalSequenceRecorder_alloc()
+            if not self._recorder:
+                return None
+            # ストリームに接続するとフレームが自動的に録画機へ供給される
+            self._dll.ACS_Stream_attachRecorder(self._stream, self._recorder)
+            self._dll.ACS_ThermalSequenceRecorder_start(self._recorder, path)
+            self._recording_path = path
+            log.info(f"録画開始: {path}")
+            return path
+        except Exception as e:
+            log.warning(f"start_recording: {e}")
+            self._cleanup_recorder()
+            return None
+
+    def stop_recording(self) -> str | None:
+        """録画を停止してファイルを保存する。保存先パスを返す。"""
+        if not self._recorder:
+            return None
+        path = self._recording_path
+        try:
+            self._dll.ACS_ThermalSequenceRecorder_stop(self._recorder)
+            if self._stream:
+                self._dll.ACS_Stream_detachRecorder(self._stream)
+        except Exception as e:
+            log.warning(f"stop_recording: {e}")
+        finally:
+            self._cleanup_recorder()
+        log.info(f"録画停止: {path}")
+        return path
+
+    def _cleanup_recorder(self):
+        if self._recorder:
+            try:
+                self._dll.ACS_ThermalSequenceRecorder_free(self._recorder)
+            except Exception:
+                pass
+        self._recorder       = None
+        self._recording_path = None
+
+    @property
+    def is_recording(self) -> bool:
+        if not self._recorder:
+            return False
+        try:
+            state = self._dll.ACS_ThermalSequenceRecorder_getState(self._recorder)
+            return state == ACS_RecorderState_recording
+        except Exception:
+            return False
+
+    def recording_status(self) -> tuple[int, int]:
+        """(経過ミリ秒, 記録フレーム数) を返す。"""
+        if not self._recorder:
+            return (0, 0)
+        try:
+            ms = self._dll.ACS_ThermalSequenceRecorder_elapsedMilliSeconds(self._recorder)
+            fc = self._dll.ACS_ThermalSequenceRecorder_getFrameCounter(self._recorder)
+            return (int(ms), int(fc))
+        except Exception:
+            return (0, 0)
 
     # ── カメラ情報 ────────────────────────────────────────────────────────────
 
@@ -629,6 +722,9 @@ class FlirCamera:
 
     def disconnect(self):
         self._connected = False
+        # 録画中なら先に停止してファイルを保存
+        if self._recorder:
+            self.stop_recording()
         for fn, obj in [
             ("ACS_Stream_stop",         self._stream),
             ("ACS_ThermalStreamer_free", self._streamer),
